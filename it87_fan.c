@@ -42,6 +42,7 @@
 
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
+#include <linux/kprobes.h>
 #include <linux/bitops.h>
 #include <linux/module.h>
 #include <linux/init.h>
@@ -65,9 +66,14 @@ enum chips { it87, it8712, it8716, it8718, it8720, it8721, it8728, it8732,
 	     it8771, it8772, it8781, it8782, it8783, it8786, it8790,
 	     it8792, it8603, it8620, it8622, it8628 };
 
+#define MAX_TEMP_POINT 5
 static unsigned short force_id;
-module_param(force_id, ushort, 0);
-MODULE_PARM_DESC(force_id, "Override the detected device ID");
+static unsigned int temp_param_num, fan_speed_param_num, temp_point;
+static int temp_bound[MAX_TEMP_POINT];
+static unsigned int fan_speed[MAX_TEMP_POINT];
+static int temp_bound_default[] = {45, 55, 70, 85};
+static unsigned int fan_speed_default[] = {10, 25, 60, 100};
+
 
 static struct platform_device *it87_pdev[2];
 
@@ -947,6 +953,7 @@ static ssize_t show_temp(struct device *dev, struct device_attribute *attr,
 	int nr = sattr->nr;
 	int index = sattr->index;
 	struct it87_data *data = it87_update_device(dev);
+	pr_info("it87_data address in %s: %x, nr: %d, index: %d\n",__func__, data, nr, index);
 
 	return sprintf(buf, "%d\n", TEMP_FROM_REG(data->temp[nr][index]));
 }
@@ -1114,6 +1121,7 @@ static ssize_t show_fan(struct device *dev, struct device_attribute *attr,
 	int index = sattr->index;
 	int speed;
 	struct it87_data *data = it87_update_device(dev);
+	pr_info("it87_data address in %s: %x, nr: %d, index: %d\n",__func__, data, nr, index);
 
 	speed = has_16bit_fans(data) ?
 		FAN16_FROM_REG(data->fan[nr][index]) :
@@ -1148,6 +1156,7 @@ static ssize_t show_pwm(struct device *dev, struct device_attribute *attr,
 	struct sensor_device_attribute *sensor_attr = to_sensor_dev_attr(attr);
 	struct it87_data *data = it87_update_device(dev);
 	int nr = sensor_attr->index;
+	pr_info("it87_data address in %s: %x, nr: %d\n",__func__, data, nr);
 
 	return sprintf(buf, "%d\n",
 		       pwm_from_reg(data, data->pwm_duty[nr]));
@@ -3242,20 +3251,20 @@ static SIMPLE_DEV_PM_OPS(it87_dev_pm_ops, NULL, it87_resume);
 
 static struct platform_driver it87_driver = {
 	.driver = {
-		.name	= DRVNAME,
+		.name   = DRVNAME,
 		.pm     = &it87_dev_pm_ops,
 	},
-	.probe	= it87_probe,
+	.probe  = it87_probe,
 };
 
 static int __init it87_device_add(int index, unsigned short address,
-				  const struct it87_sio_data *sio_data)
+		const struct it87_sio_data *sio_data)
 {
 	struct platform_device *pdev;
 	struct resource res = {
-		.start	= address + IT87_EC_OFFSET,
-		.end	= address + IT87_EC_OFFSET + IT87_EC_EXTENT - 1,
-		.name	= DRVNAME,
+		.start  = address + IT87_EC_OFFSET,
+		.end    = address + IT87_EC_OFFSET + IT87_EC_EXTENT - 1,
+		.name   = DRVNAME,
 		.flags	= IORESOURCE_IO,
 	};
 	int err;
@@ -3295,6 +3304,128 @@ exit_device_put:
 	return err;
 }
 
+static int precede_module_param_check(void)
+{
+	int err;
+	if (temp_param_num == 0 || temp_param_num > MAX_TEMP_POINT
+		|| temp_param_num != fan_speed_param_num) {
+		err = -EINVAL;
+		goto exit_param_check;
+	}
+	temp_point = temp_param_num;
+	if (temp_bound[0] < -7 || temp_bound[temp_point - 1] > 95 ||
+		fan_speed[0] < 0 || fan_speed[temp_point - 1] > 100) {
+		err = -EDOM;
+		goto exit_param_check;
+	}
+	while (temp_param_num > 0) {
+		--temp_param_num;
+		if (temp_bound[temp_param_num] <= temp_bound[temp_param_num - 1]){
+			err = -EINVAL;
+			goto exit_param_check;
+		}
+	}
+	while (fan_speed_param_num > 0) {
+		--fan_speed_param_num;
+		if (fan_speed[fan_speed_param_num] <=
+				fan_speed[fan_speed_param_num - 1]) {
+			err = -EINVAL;
+			goto exit_param_check;
+		}
+	}
+	return 0;
+exit_param_check:
+	pr_info("check module param fail with code: %d, use default setting", err);
+	temp_point = ARRAY_SIZE(temp_bound_default);
+	memcpy(temp_bound, temp_bound_default, sizeof(temp_bound_default));
+	memcpy(fan_speed, fan_speed_default, sizeof(fan_speed_default));
+	return 0;
+}
+
+static void it87_fan_timer_func(struct timer_list * timer)
+{
+	static int temp_zone = 0;
+	struct it87_data *data = dev_get_drvdata(&it87_pdev[0]->dev);
+	int read_temp = TEMP_FROM_REG(data->temp[1][0]);
+	if (temp_zone < (temp_param_num - 1) &&
+			read_temp > temp_bound[temp_zone]) {
+		temp_zone++;
+	} else if (temp_zone > 0 && read_temp > temp_bound[temp_zone]) {
+		temp_zone--;
+	}
+	mutex_lock(&data->update_lock);
+	it87_update_pwm_ctrl(data, 1);
+	if (data->pwm_ctrl[1] & 0x80) {
+		mutex_unlock(&data->update_lock);
+		goto exit_fan_timer;
+	}
+	data->pwm_duty[1] = pwm_to_reg(data, fan_speed[temp_zone] * 255 / 100);
+	it87_write_value(data, IT87_REG_PWM_DUTY[1],
+			data->pwm_duty[1]);
+	mutex_unlock(&data->update_lock);
+	goto exit_fan_timer;
+
+exit_fan_timer:
+	mod_timer(timer, jiffies + 3*HZ);
+	return;
+}
+
+static DEFINE_TIMER(fan_timer, it87_fan_timer_func);
+
+static int it87_fan_timer_add(void)
+{
+	int err;
+	struct it87_data *data = it87_update_device(&(it87_pdev[0]->dev));
+	int read_temp = TEMP_FROM_REG(data->temp[1][0]);
+	int fan_input = has_16bit_fans(data) ?
+		FAN16_FROM_REG(data->fan[1][0]) :
+		FAN_FROM_REG(data->fan[1][0],
+				DIV_FROM_REG(data->fan_div[1]));
+
+	if (read_temp == -7000 || fan_input == 0) {
+		err = -ENODEV;
+		pr_err("read a invalid temperature value or fan "
+		"rotation speed, maybe hardware is mismatch or "
+		"fan is not connected");
+		goto exit_fan_check;
+	}
+	fan_timer.expires = jiffies + 3*HZ;
+	if (err)
+	add_timer(&fan_timer);
+exit_fan_check:
+	return err;
+}
+
+#if 0
+static int pre_handler(struct kprobe *p, struct pt_regs *regs)
+{
+    printk(KERN_INFO "pre_handler: p->addr = 0x%p, ip = %lx, flags = 0x%lx\n",
+           p->addr, regs->ip, regs->flags);
+    return 0;
+}
+
+static void
+post_handler(struct kprobe *p, struct pt_regs *regs, unsigned long flags)
+{
+    printk(KERN_INFO "post_handler: p->addr = 0x%p, flags = 0x%lx\n",
+           p->addr, regs->flags);
+}
+
+static int fault_handler(struct kprobe *p, struct pt_regs *regs, int trapnr)
+{
+    printk(KERN_INFO "fault_handler: p->addr = 0x%p, trap #%d\n",
+           p->addr, trapnr);
+    return 0;
+}
+
+static struct kprobe kp = {
+    .symbol_name   = "it87_fan_timer_add",      // 要追踪的内核函数为 do_fork
+    .pre_handler   = pre_handler,    // pre_handler 回调函数
+    .post_handler  = post_handler,   // post_handler 回调函数
+    .fault_handler = fault_handler,  // fault_handler 回调函数
+};
+#endif
+
 static int __init sm_it87_init(void)
 {
 	int sioaddr[2] = { REG_2E, REG_4E };
@@ -3302,6 +3433,16 @@ static int __init sm_it87_init(void)
 	unsigned short isa_address[2];
 	bool found = false;
 	int i, err;
+
+	// err = register_kprobe(&kp); // 调用 register_kprobe 注册追踪点
+	// if (err < 0) {
+	// 	printk(KERN_INFO "register_kprobe failed, returned %d\n", err);
+	// 	return err;
+	// }
+
+	err = precede_module_param_check();
+	if (err)
+		return err;
 
 	err = platform_driver_register(&it87_driver);
 	if (err)
@@ -3338,7 +3479,7 @@ static int __init sm_it87_init(void)
 		err = -ENODEV;
 		goto exit_unregister;
 	}
-	return 0;
+	return it87_fan_timer_add();
 
 exit_dev_unregister:
 	/* NULL check handled by platform_device_unregister */
@@ -3350,19 +3491,22 @@ exit_unregister:
 
 static void __exit sm_it87_exit(void)
 {
+	del_timer_sync(&fan_timer);
 	/* NULL check handled by platform_device_unregister */
 	platform_device_unregister(it87_pdev[1]);
 	platform_device_unregister(it87_pdev[0]);
 	platform_driver_unregister(&it87_driver);
+	// unregister_kprobe(&kp); // 调用 unregister_kprobe 注销追踪点
 }
 
 MODULE_AUTHOR("Chris Gauthron, Jean Delvare <jdelvare@suse.de>");
 MODULE_DESCRIPTION("IT8705F/IT871xF/IT872xF hardware monitoring driver");
-module_param(update_vbat, bool, 0);
-MODULE_PARM_DESC(update_vbat, "Update vbat if set else return powerup value");
-module_param(fix_pwm_polarity, bool, 0);
-MODULE_PARM_DESC(fix_pwm_polarity,
-		 "Force PWM polarity to active high (DANGEROUS)");
+module_param_array(temp_bound, int, &temp_param_num, S_IRUGO);
+MODULE_PARM_DESC(temp_bound, "Temperature critical point trigger PWM fan speed"
+	"change (require: -7 <= temp_bound <= 95, default: 45,55,70,85)");
+module_param_array(fan_speed, uint, &fan_speed_param_num, S_IRUGO);
+MODULE_PARM_DESC(fan_speed, "Fan speed according temperature critical point "
+	"(require: 0 <= fan_speed <= 100, defautl: 10,25,60,100)");
 MODULE_LICENSE("GPL");
 
 module_init(sm_it87_init);
