@@ -19,8 +19,8 @@ tweak_fan()
 
 main()
 (
-	modprobe it87 || exit -1
-	cd /sys/class/hwmon/hwmon2
+	modprobe it87 || exit 1
+	cd /sys/class/hwmon/hwmon2 || exit 2
 	tweak_fan > /dev/null
 )
 

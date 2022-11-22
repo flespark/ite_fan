@@ -1,4 +1,4 @@
-KDIR ?= /lib/modules/$(shell uname -r)/build
+KDIR ?= /lib/modules/5.19.0-0.deb11.2-amd64/build
 obj-m += it87.o
 it87-objs += it87_fan.o hwmon-vid.o
 
